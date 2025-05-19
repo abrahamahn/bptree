@@ -2,3 +2,9 @@
 node_modules
 *.log
 build
+
+extract.py
+extract.txt
+
+test.py
+test.txt

@@ -1,13 +1,11 @@
-import { AsyncOrderedKeyValueApi } from "../lib/types"
+import { AsyncOrderedKeyValueApi, WriteArgs, ListArgs } from '../lib/types'
 
-// Constants for tree structure
 const LEAF_PREFIX = "00"
 const INTERNAL_PREFIX = "01"
 const METADATA_KEY = "__BPTREE_METADATA__"
-const MAX_LEAF_SIZE = 32
-const MAX_INTERNAL_SIZE = 32
+const DEFAULT_MAX_LEAF_SIZE = 32
+const DEFAULT_MAX_INTERNAL_SIZE = 32
 
-// Types for tree nodes
 type LeafNode = {
     keys: string[]
     values: string[]
@@ -29,19 +27,35 @@ type TreeMetadata = {
     height: number
 }
 
+/**
+ * An asynchronous B+ Tree implementation on top of an ordered key-value store.
+ * This implementation uses a prefix-based approach for storing nodes:
+ * - Leaf nodes are prefixed with "00"
+ * - Internal nodes are prefixed with "01"
+ */
 export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
     private rootId: string // Reference to root node
     private height: number = 0
     private initialized: boolean = false
 
+    /**
+     * Creates a new asynchronous B+ Tree
+     * 
+     * @param store The underlying asynchronous store to use
+     * @param maxLeafSize Maximum number of keys in a leaf node before splitting
+     * @param maxInternalSize Maximum number of keys in an internal node before splitting
+     */
     constructor(
         private store: AsyncOrderedKeyValueApi<string, string>,
-        private maxLeafSize: number = MAX_LEAF_SIZE,
-        private maxInternalSize: number = MAX_INTERNAL_SIZE
+        private maxLeafSize: number = DEFAULT_MAX_LEAF_SIZE,
+        private maxInternalSize: number = DEFAULT_MAX_INTERNAL_SIZE
     ) {
         // Initialization is handled in the init method
     }
 
+    /**
+     * Initializes the B+ Tree, either loading an existing tree or creating a new one
+     */
     async init(): Promise<void> {
         // Try to load existing metadata
         const metadataStr = await this.store.get(METADATA_KEY)
@@ -52,7 +66,7 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
             this.rootId = metadata.rootId
             this.height = metadata.height
         } else {
-            // Initialize a new tree
+            // Initialize a new tree with an empty root leaf node
             const rootNode: LeafNode = { keys: [], values: [] }
             this.rootId = LEAF_PREFIX + "root"
             this.height = 0
@@ -68,6 +82,9 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         this.initialized = true
     }
 
+    /**
+     * Saves the current tree metadata to the store
+     */
     private async saveMetadata(): Promise<void> {
         const metadata: TreeMetadata = {
             rootId: this.rootId,
@@ -79,33 +96,49 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         })
     }
 
+    /**
+     * Gets a value by key
+     * 
+     * @param key The key to look up
+     * @returns The value or undefined if not found
+     */
     async get(key: string): Promise<string | undefined> {
         if (!this.initialized) await this.init()
         
         const leafNode = await this.findLeaf(key)
-        const node = JSON.parse(await this.store.get(leafNode) || "{}") as LeafNode
+        const nodeStr = await this.store.get(leafNode)
+        if (!nodeStr) return undefined
+        
+        const node = JSON.parse(nodeStr) as LeafNode
         const index = node.keys.indexOf(key)
         return index !== -1 ? node.values[index] : undefined
     }
 
-    async list(args: {
-        gt?: string
-        gte?: string
-        lt?: string
-        lte?: string
-        limit?: number
-        offset?: number
-        reverse?: boolean
-    } = {}): Promise<{ key: string; value: string }[]> {
+    /**
+     * Lists entries in a range
+     * 
+     * @param args Range query parameters
+     * @returns Array of key-value pairs in the range
+     */
+    async list(args: ListArgs<string> = {}): Promise<{ key: string; value: string }[]> {
         if (!this.initialized) await this.init()
         
         const results: { key: string; value: string }[] = []
         let current = await this.findLeaf(args.gte || args.gt || "")
         
         while (current && current !== "") {
-            const node = JSON.parse(await this.store.get(current) || "{}") as LeafNode
+            const nodeStr = await this.store.get(current)
+            if (!nodeStr) break
+            
+            const node = JSON.parse(nodeStr) as LeafNode
             const startIndex = args.gt ? node.keys.findIndex(k => k > args.gt!) : 
                               args.gte ? node.keys.findIndex(k => k >= args.gte!) : 0
+            
+            if (startIndex === -1) {
+                // No keys in this node match our criteria, move to next node
+                current = node.next || ""
+                continue
+            }
             
             for (let i = startIndex; i < node.keys.length; i++) {
                 const key = node.keys[i]
@@ -119,20 +152,45 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
             current = node.next || ""
         }
         
+        // Apply offset and reverse if needed
+        if (args.offset && args.offset > 0) {
+            results.splice(0, args.offset)
+        }
+        
+        if (args.reverse) {
+            results.reverse()
+        }
+        
         return results
     }
 
+    /**
+     * Sets a value for a key
+     * 
+     * @param key The key to set
+     * @param value The value to set
+     */
     async set(key: string, value: string): Promise<void> {
         if (!this.initialized) await this.init()
         await this.write({ set: [{ key, value }] })
     }
 
+    /**
+     * Deletes a key
+     * 
+     * @param key The key to delete
+     */
     async delete(key: string): Promise<void> {
         if (!this.initialized) await this.init()
         await this.write({ delete: [key] })
     }
 
-    async write(tx: { set?: { key: string; value: string }[]; delete?: string[] }): Promise<void> {
+    /**
+     * Performs a batch write operation
+     * 
+     * @param tx The write transaction
+     */
+    async write(tx: WriteArgs<string, string>): Promise<void> {
         if (!this.initialized) await this.init()
         
         // Process each operation individually
@@ -144,10 +202,17 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         }
     }
 
+    /**
+     * Inserts a key-value pair into the tree
+     * 
+     * @param key The key to insert
+     * @param value The value to insert
+     */
     private async insert(key: string, value: string): Promise<void> {
         if (this.height === 0) {
             // Tree is empty or has only a root leaf node
-            const node = JSON.parse(await this.store.get(this.rootId) || "{}") as LeafNode
+            const nodeStr = await this.store.get(this.rootId)
+            const node = JSON.parse(nodeStr || "{}") as LeafNode
             
             // Insert into leaf node
             const index = this.findInsertIndex(node.keys, key)
@@ -173,7 +238,8 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         // Find the leaf node where the key should be inserted
         const path = await this.findNodePath(key)
         const leafId = path[path.length - 1].id
-        const leafNode = JSON.parse(await this.store.get(leafId) || "{}") as LeafNode
+        const leafNodeStr = await this.store.get(leafId)
+        const leafNode = JSON.parse(leafNodeStr || "{}") as LeafNode
         
         // Insert into leaf node
         const index = this.findInsertIndex(leafNode.keys, key)
@@ -195,9 +261,15 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         }
     }
 
+    /**
+     * Removes a key-value pair from the tree
+     * 
+     * @param key The key to remove
+     */
     private async remove(key: string): Promise<void> {
         if (this.height === 0) {
-            const rootNode = JSON.parse(await this.store.get(this.rootId) || "{}") as LeafNode
+            const rootNodeStr = await this.store.get(this.rootId)
+            const rootNode = JSON.parse(rootNodeStr || "{}") as LeafNode
             const index = rootNode.keys.indexOf(key)
             
             if (index === -1) return
@@ -211,7 +283,8 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         // Find the leaf node containing the key
         const path = await this.findNodePath(key)
         const leafId = path[path.length - 1].id
-        const leafNode = JSON.parse(await this.store.get(leafId) || "{}") as LeafNode
+        const leafNodeStr = await this.store.get(leafId)
+        const leafNode = JSON.parse(leafNodeStr || "{}") as LeafNode
         const index = leafNode.keys.indexOf(key)
         
         if (index === -1) return
@@ -226,6 +299,13 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         }
     }
 
+    /**
+     * Splits a leaf node when it exceeds the maximum size
+     * 
+     * @param nodeId ID of the node to split
+     * @param node The node to split
+     * @param path Path to the node (optional)
+     */
     private async splitLeafNode(nodeId: string, node: LeafNode, path: NodePath[] = []): Promise<void> {
         const mid = Math.floor(node.keys.length / 2)
         const newNodeId = LEAF_PREFIX + Date.now() + Math.random().toString(36).substring(2, 10)
@@ -268,6 +348,13 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         }
     }
 
+    /**
+     * Splits an internal node when it exceeds the maximum size
+     * 
+     * @param nodeId ID of the node to split
+     * @param node The node to split
+     * @param path Path to the node
+     */
     private async splitInternalNode(nodeId: string, node: InternalNode, path: NodePath[]): Promise<void> {
         const mid = Math.floor(node.keys.length / 2)
         const splitKey = node.keys[mid]
@@ -305,7 +392,8 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
             // Update parent
             const parentPath = path.slice(0, -1)
             const parentId = parentPath[parentPath.length - 1]?.id || this.rootId
-            const parent = JSON.parse(await this.store.get(parentId) || "{}") as InternalNode
+            const parentStr = await this.store.get(parentId)
+            const parent = JSON.parse(parentStr || "{}") as InternalNode
             const childIndex = path[path.length - 1].index
             
             // Insert the new node in the parent
@@ -320,10 +408,19 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         }
     }
 
+    /**
+     * Updates a parent node after a child split
+     * 
+     * @param leftId ID of the left child
+     * @param rightId ID of the right child
+     * @param splitKey The key that separates the children
+     * @param path Path to the node
+     */
     private async updateParentAfterSplit(leftId: string, rightId: string, splitKey: string, path: NodePath[]): Promise<void> {
         const parentPath = path.slice(0, -1)
         const parentId = parentPath[parentPath.length - 1]?.id || this.rootId
-        const parent = JSON.parse(await this.store.get(parentId) || "{}") as InternalNode
+        const parentStr = await this.store.get(parentId)
+        const parent = JSON.parse(parentStr || "{}") as InternalNode
         const childIndex = path[path.length - 1].index
         
         // Insert the new node in the parent
@@ -337,16 +434,25 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         }
     }
 
+    /**
+     * Rebalances the tree after a delete operation
+     * 
+     * @param nodeId ID of the node to rebalance
+     * @param node The node to rebalance
+     * @param path Path to the node
+     */
     private async rebalanceAfterDelete(nodeId: string, node: LeafNode | InternalNode, path: NodePath[]): Promise<void> {
         const parentPath = path.slice(0, -1)
         const parentId = parentPath[parentPath.length - 1]?.id || this.rootId
-        const parent = JSON.parse(await this.store.get(parentId) || "{}") as InternalNode
+        const parentStr = await this.store.get(parentId)
+        const parent = JSON.parse(parentStr || "{}") as InternalNode
         const childIndex = path[path.length - 1].index
         
         // Try to borrow from left sibling
         if (childIndex > 0) {
             const leftSiblingId = parent.children[childIndex - 1]
-            const leftSibling = JSON.parse(await this.store.get(leftSiblingId) || "{}") as any
+            const leftSiblingStr = await this.store.get(leftSiblingId)
+            const leftSibling = JSON.parse(leftSiblingStr || "{}") as any
             
             if (leftSibling.keys.length > Math.ceil(this.maxLeafSize / 2)) {
                 await this.borrowFromLeftSibling(nodeId, node, leftSiblingId, leftSibling, parentId, parent, childIndex)
@@ -357,7 +463,8 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         // Try to borrow from right sibling
         if (childIndex < parent.children.length - 1) {
             const rightSiblingId = parent.children[childIndex + 1]
-            const rightSibling = JSON.parse(await this.store.get(rightSiblingId) || "{}") as any
+            const rightSiblingStr = await this.store.get(rightSiblingId)
+            const rightSibling = JSON.parse(rightSiblingStr || "{}") as any
             
             if (rightSibling.keys.length > Math.ceil(this.maxLeafSize / 2)) {
                 await this.borrowFromRightSibling(nodeId, node, rightSiblingId, rightSibling, parentId, parent, childIndex)
@@ -369,16 +476,21 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         if (childIndex > 0) {
             // Merge with left sibling
             const leftSiblingId = parent.children[childIndex - 1]
-            const leftSibling = JSON.parse(await this.store.get(leftSiblingId) || "{}") as any
+            const leftSiblingStr = await this.store.get(leftSiblingId)
+            const leftSibling = JSON.parse(leftSiblingStr || "{}") as any
             await this.mergeWithLeftSibling(nodeId, node, leftSiblingId, leftSibling, parentId, parent, childIndex, parentPath)
         } else {
             // Merge with right sibling
             const rightSiblingId = parent.children[childIndex + 1]
-            const rightSibling = JSON.parse(await this.store.get(rightSiblingId) || "{}") as any
+            const rightSiblingStr = await this.store.get(rightSiblingId)
+            const rightSibling = JSON.parse(rightSiblingStr || "{}") as any
             await this.mergeWithRightSibling(nodeId, node, rightSiblingId, rightSibling, parentId, parent, childIndex, parentPath)
         }
     }
 
+    /**
+     * Borrows a key-value pair from the left sibling
+     */
     private async borrowFromLeftSibling(
         nodeId: string,
         node: any,
@@ -419,6 +531,9 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         })
     }
 
+    /**
+     * Borrows a key-value pair from the right sibling
+     */
     private async borrowFromRightSibling(
         nodeId: string,
         node: any,
@@ -459,6 +574,9 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         })
     }
 
+    /**
+     * Merges a node with its left sibling
+     */
     private async mergeWithLeftSibling(
         nodeId: string,
         node: any,
@@ -508,6 +626,9 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         }
     }
 
+    /**
+     * Merges a node with its right sibling
+     */
     private async mergeWithRightSibling(
         nodeId: string,
         node: any,
@@ -557,13 +678,20 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         }
     }
 
+    /**
+     * Finds the path from the root to the leaf node that should contain the key
+     * 
+     * @param key The key to look up
+     * @returns Array of node paths from root to leaf
+     */
     private async findNodePath(key: string): Promise<NodePath[]> {
         const path: NodePath[] = []
         let current = this.rootId
         let level = 0
         
         while (level < this.height) {
-            const node = JSON.parse(await this.store.get(current) || "{}") as InternalNode
+            const nodeStr = await this.store.get(current)
+            const node = JSON.parse(nodeStr || "{}") as InternalNode
             const index = this.findChildIndex(node.keys, key)
             path.push({ id: current, index })
             current = node.children[index] || node.children[node.children.length - 1]
@@ -574,12 +702,19 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         return path
     }
 
+    /**
+     * Finds the leaf node that should contain the key
+     * 
+     * @param key The key to look up
+     * @returns ID of the leaf node
+     */
     private async findLeaf(key: string): Promise<string> {
         let current = this.rootId
         let level = 0
         
         while (level < this.height) {
-            const node = JSON.parse(await this.store.get(current) || "{}") as InternalNode
+            const nodeStr = await this.store.get(current)
+            const node = JSON.parse(nodeStr || "{}") as InternalNode
             const index = this.findChildIndex(node.keys, key)
             current = node.children[index] || node.children[node.children.length - 1]
             level++
@@ -588,6 +723,13 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         return current
     }
 
+    /**
+     * Finds the index of the child that should contain the key
+     * 
+     * @param keys Array of keys
+     * @param key The key to look up
+     * @returns Index of the child
+     */
     private findChildIndex(keys: string[], key: string): number {
         let left = 0
         let right = keys.length
@@ -604,6 +746,13 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         return left
     }
 
+    /**
+     * Finds the index where a key should be inserted
+     * 
+     * @param keys Array of keys
+     * @param key The key to insert
+     * @returns Index where the key should be inserted
+     */
     private findInsertIndex(keys: string[], key: string): number {
         let left = 0
         let right = keys.length
@@ -621,4 +770,4 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         
         return left
     }
-} 
+}

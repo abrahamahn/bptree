@@ -81,6 +81,14 @@ export class IndexedDbOrderedKeyValueStorage<V = any>
 		return results
 	}
 
+	async set(key: string, value: V): Promise<void> {
+		await this.write({ set: [{ key, value }] });
+	}
+
+	async delete(key: string): Promise<void> {
+		await this.write({ delete: [key] });
+	}
+
 	async write(writes: {
 		set?: { key: string; value: V }[]
 		delete?: string[]
