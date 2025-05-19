@@ -24,7 +24,7 @@
 		"@types/node": "^22.9.0",
 		"mocha": "^10.8.2",
 		"ts-node": "^10.9.2",
-		"tsx": "^4.19.2",
+		"tsx": "^4.19.4",
 		"typescript": "^5.6.3"
 	},
 	"dependencies": {
