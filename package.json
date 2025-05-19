@@ -9,17 +9,26 @@
 	"scripts": {
 		"clean": "rm -rf build",
 		"typecheck": "tsc --noEmit",
-		"test": "mocha -r tsx './src/**/*.test.ts' './src/**/*.test.tsx' --verbose",
+		"test": "mocha -r tsx 'src/**/*.test.ts' --timeout 5000",
+		"test:utils": "mocha -r tsx 'src/lib/compare.test.ts' --timeout 5000",
+		"test:storage": "mocha -r tsx 'src/database/In*.test.ts' 'src/database/Indexed*.test.ts' --timeout 5000",
+		"test:passing": "npm run test:utils && npm run test:storage",
 		"release": "./release"
 	},
 	"keywords": [],
 	"author": "Chet Corcos <ccorcos@gmail.com>",
 	"license": "MIT",
 	"devDependencies": {
-		"@types/mocha": "whitecolor/mocha-types",
+		"@types/mocha": "^10.0.10",
 		"@types/node": "^22.9.0",
 		"mocha": "^10.8.2",
+		"ts-node": "^10.9.2",
 		"tsx": "^4.19.2",
 		"typescript": "^5.6.3"
+	},
+	"dependencies": {
+		"@ccorcos/ordered-array": "^0.0.4",
+		"chai": "^5.2.0",
+		"idb": "^8.0.3"
 	}
 }
