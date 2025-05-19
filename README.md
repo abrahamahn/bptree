@@ -58,13 +58,6 @@ Extend the B+ tree to:
 - Add Merkle tree (Prolly Tree) functionality using rolling hash functions
 - Consider Dolt's approach for more consistent chunk sizes
 
-## Development Approach
-
-This project will be built from scratch using:
-- TypeScript for type safety and developer experience
-- Comprehensive unit tests for all functionality
-- Performance benchmarks for key operations
-
 ## Getting Started
 
 ### Prerequisites
