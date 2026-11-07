@@ -34,7 +34,7 @@ type TreeMetadata = {
  * - Internal nodes are prefixed with "01"
  */
 export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
-    private rootId: string // Reference to root node
+    private rootId: string = "" // Reference to root node
     private height: number = 0
     private initialized: boolean = false
 
@@ -126,7 +126,7 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         const results: { key: string; value: string }[] = []
         let current = await this.findLeaf(args.gte || args.gt || "")
         
-        while (current && current !== "") {
+        outer: while (current && current !== "") {
             const nodeStr = await this.store.get(current)
             if (!nodeStr) break
             
@@ -142,23 +142,27 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
             
             for (let i = startIndex; i < node.keys.length; i++) {
                 const key = node.keys[i]
-                if (args.lt && key >= args.lt) return results
-                if (args.lte && key > args.lte) return results
+                if (args.lt && key >= args.lt) break outer
+                if (args.lte && key > args.lte) break outer
                 
                 results.push({ key, value: node.values[i] })
-                if (args.limit && results.length >= args.limit) return results
+                if (!args.reverse && !args.offset && args.limit && results.length >= args.limit) break outer
             }
             
             current = node.next || ""
         }
         
-        // Apply offset and reverse if needed
+        // Apply reverse, offset, and limit if needed
+        if (args.reverse) {
+            results.reverse()
+        }
+        
         if (args.offset && args.offset > 0) {
             results.splice(0, args.offset)
         }
         
-        if (args.reverse) {
-            results.reverse()
+        if (args.limit !== undefined) {
+            results.splice(args.limit)
         }
         
         return results
@@ -375,7 +379,7 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
             ]
         })
         
-        if (path.length === 0) {
+        if (path.length <= 1) {
             // This is the root node, create a new root
             const newRoot: InternalNode = {
                 keys: [splitKey],
@@ -391,10 +395,11 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         } else {
             // Update parent
             const parentPath = path.slice(0, -1)
-            const parentId = parentPath[parentPath.length - 1]?.id || this.rootId
+            const parentEntry = parentPath[parentPath.length - 1]
+            const parentId = parentEntry?.id || this.rootId
             const parentStr = await this.store.get(parentId)
             const parent = JSON.parse(parentStr || "{}") as InternalNode
-            const childIndex = path[path.length - 1].index
+            const childIndex = parentEntry.index
             
             // Insert the new node in the parent
             parent.keys.splice(childIndex, 0, splitKey)
@@ -418,10 +423,11 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
      */
     private async updateParentAfterSplit(leftId: string, rightId: string, splitKey: string, path: NodePath[]): Promise<void> {
         const parentPath = path.slice(0, -1)
-        const parentId = parentPath[parentPath.length - 1]?.id || this.rootId
+        const parentEntry = parentPath[parentPath.length - 1]
+        const parentId = parentEntry?.id || this.rootId
         const parentStr = await this.store.get(parentId)
         const parent = JSON.parse(parentStr || "{}") as InternalNode
-        const childIndex = path[path.length - 1].index
+        const childIndex = parentEntry.index
         
         // Insert the new node in the parent
         parent.keys.splice(childIndex, 0, splitKey)
@@ -443,10 +449,13 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
      */
     private async rebalanceAfterDelete(nodeId: string, node: LeafNode | InternalNode, path: NodePath[]): Promise<void> {
         const parentPath = path.slice(0, -1)
-        const parentId = parentPath[parentPath.length - 1]?.id || this.rootId
+        const parentEntry = parentPath[parentPath.length - 1]
+        const parentId = parentEntry?.id || this.rootId
         const parentStr = await this.store.get(parentId)
         const parent = JSON.parse(parentStr || "{}") as InternalNode
-        const childIndex = path[path.length - 1].index
+        const childIndex = parentEntry.index
+        
+        const minKeys = 'values' in node ? Math.ceil(this.maxLeafSize / 2) : Math.ceil(this.maxInternalSize / 2)
         
         // Try to borrow from left sibling
         if (childIndex > 0) {
@@ -454,7 +463,7 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
             const leftSiblingStr = await this.store.get(leftSiblingId)
             const leftSibling = JSON.parse(leftSiblingStr || "{}") as any
             
-            if (leftSibling.keys.length > Math.ceil(this.maxLeafSize / 2)) {
+            if (leftSibling.keys.length > minKeys) {
                 await this.borrowFromLeftSibling(nodeId, node, leftSiblingId, leftSibling, parentId, parent, childIndex)
                 return
             }
@@ -466,7 +475,7 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
             const rightSiblingStr = await this.store.get(rightSiblingId)
             const rightSibling = JSON.parse(rightSiblingStr || "{}") as any
             
-            if (rightSibling.keys.length > Math.ceil(this.maxLeafSize / 2)) {
+            if (rightSibling.keys.length > minKeys) {
                 await this.borrowFromRightSibling(nodeId, node, rightSiblingId, rightSibling, parentId, parent, childIndex)
                 return
             }
@@ -613,7 +622,7 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         })
         
         // Check if parent needs rebalancing
-        if (parent.keys.length < Math.ceil(this.maxInternalSize / 2) && parentPath.length > 0) {
+        if (parent.keys.length < Math.ceil(this.maxInternalSize / 2) && parentPath.length > 1) {
             await this.rebalanceAfterDelete(parentId, parent, parentPath)
         } else if (parent.keys.length === 0 && parentId === this.rootId) {
             // Root is empty, make the merged node the new root
@@ -665,7 +674,7 @@ export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
         })
         
         // Check if parent needs rebalancing
-        if (parent.keys.length < Math.ceil(this.maxInternalSize / 2) && parentPath.length > 0) {
+        if (parent.keys.length < Math.ceil(this.maxInternalSize / 2) && parentPath.length > 1) {
             await this.rebalanceAfterDelete(parentId, parent, parentPath)
         } else if (parent.keys.length === 0 && parentId === this.rootId) {
             // Root is empty, make the merged node the new root

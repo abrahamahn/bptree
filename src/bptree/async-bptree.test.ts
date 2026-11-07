@@ -304,17 +304,18 @@ describe("AsyncBPlusTree with MockAsyncStorage", () => {
             
             // Test range query over deletion gap
             const result = await bPlusTree.list({ gte: "key010", lt: "key050" });
-            expect(result).to.have.lengthOf(30); // 50-10-20(deleted)=30
+            expect(result).to.have.lengthOf(20); // 50-10-20(deleted)=20
             expect(result[0].key).to.equal("key010");
             expect(result[9].key).to.equal("key019");
             expect(result[10].key).to.equal("key040");
         });
         
         it("should handle random inserts and deletes while maintaining correct order", async () => {
-            const keys: string[] = [];
-            for (let i = 0; i < 100; i++) {
-                keys.push(`key${Math.floor(Math.random() * 1000).toString().padStart(4, '0')}`);
+            const keySet = new Set<string>();
+            while (keySet.size < 100) {
+                keySet.add(`key${Math.floor(Math.random() * 1000).toString().padStart(4, '0')}`);
             }
+            const keys = Array.from(keySet);
             
             // Insert in random order
             for (let i = 0; i < keys.length; i++) {
