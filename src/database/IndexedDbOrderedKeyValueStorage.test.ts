@@ -1,95 +1,12 @@
-import { describe, it, beforeEach, afterEach } from 'mocha';
+import { describe, it, beforeEach } from 'mocha';
 import { expect } from 'chai';
-import { AsyncOrderedKeyValueApi } from "../lib/types";
+import { AsyncInMemoryDatabase } from "./AsyncInMemoryDatabase";
 
-// Create a mock implementation of the IndexedDB storage
-// This avoids trying to mock the 'idb' library and instead creates a test double
-class MockIndexedDbStorage<V = any> implements AsyncOrderedKeyValueApi<string, V> {
-    private data: Map<string, V> = new Map();
-
-    async get(key: string): Promise<V | undefined> {
-        return this.data.get(key);
-    }
-
-    async list(
-        args: {
-            gt?: string;
-            gte?: string;
-            lt?: string;
-            lte?: string;
-            limit?: number;
-            reverse?: boolean;
-        } = {}
-    ): Promise<{ key: string; value: V }[]> {
-        // Convert map to array
-        let items = Array.from(this.data.entries()).map(([key, value]) => ({ key, value }));
-        
-        // Sort by key
-        items.sort((a, b) => a.key.localeCompare(b.key));
-        
-        // Apply range filters
-        if (args.gt !== undefined) {
-            items = items.filter(item => item.key > args.gt!);
-        }
-        if (args.gte !== undefined) {
-            items = items.filter(item => item.key >= args.gte!);
-        }
-        if (args.lt !== undefined) {
-            items = items.filter(item => item.key < args.lt!);
-        }
-        if (args.lte !== undefined) {
-            items = items.filter(item => item.key <= args.lte!);
-        }
-        
-        // Apply reverse if needed
-        if (args.reverse) {
-            items.reverse();
-        }
-        
-        // Apply limit if needed
-        if (args.limit) {
-            items = items.slice(0, args.limit);
-        }
-        
-        return items;
-    }
-
-    async set(key: string, value: V): Promise<void> {
-        await this.write({ set: [{ key, value }] });
-    }
-
-    async delete(key: string): Promise<void> {
-        await this.write({ delete: [key] });
-    }
-
-    async write(tx: { set?: { key: string; value: V }[]; delete?: string[] }): Promise<void> {
-        if (tx.set) {
-            for (const { key, value } of tx.set) {
-                this.data.set(key, value);
-            }
-        }
-        
-        if (tx.delete) {
-            for (const key of tx.delete) {
-                this.data.delete(key);
-            }
-        }
-    }
-
-    // Add a method to simulate closing the connection
-    async close(): Promise<void> {
-        // No-op in our mock
-    }
-}
-
-// Instead of testing the actual IndexedDbOrderedKeyValueStorage implementation,
-// we'll test our mock implementation which conforms to the same interface
-describe('IndexedDB Storage (Mock Implementation)', () => {
-    let storage: MockIndexedDbStorage<string>;
+describe('AsyncInMemoryDatabase (AsyncOrderedKeyValueApi)', () => {
+    let storage: AsyncInMemoryDatabase<string>;
     
     beforeEach(() => {
-        // Create a new storage instance
-        storage = new MockIndexedDbStorage<string>();
+        storage = new AsyncInMemoryDatabase<string>();
     });
     
     it('should set and get values correctly', async () => {

@@ -1,93 +1,14 @@
 import { describe, it, beforeEach } from 'mocha';
 import { expect } from "chai";
 import { AsyncBPlusTree } from "./async-bptree";
-import { AsyncOrderedKeyValueApi } from "../lib/types";
+import { AsyncInMemoryDatabase } from "../database/AsyncInMemoryDatabase";
 
-// Mock implementation of AsyncOrderedKeyValueApi for testing
-class MockAsyncStorage implements AsyncOrderedKeyValueApi<string, string> {
-    private data: Map<string, string> = new Map();
-
-    async get(key: string): Promise<string | undefined> {
-        return this.data.get(key);
-    }
-
-    async list(args: {
-        gt?: string;
-        gte?: string;
-        lt?: string;
-        lte?: string;
-        limit?: number;
-        offset?: number;
-        reverse?: boolean;
-    } = {}): Promise<{ key: string; value: string }[]> {
-        // Convert map to array
-        let items = Array.from(this.data.entries()).map(([key, value]) => ({ key, value }));
-        
-        // Sort by key
-        items.sort((a, b) => a.key.localeCompare(b.key));
-        
-        // Apply range filters
-        if (args.gt !== undefined) {
-            items = items.filter(item => item.key > args.gt!);
-        }
-        if (args.gte !== undefined) {
-            items = items.filter(item => item.key >= args.gte!);
-        }
-        if (args.lt !== undefined) {
-            items = items.filter(item => item.key < args.lt!);
-        }
-        if (args.lte !== undefined) {
-            items = items.filter(item => item.key <= args.lte!);
-        }
-        
-        // Apply reverse if needed
-        if (args.reverse) {
-            items.reverse();
-        }
-        
-        // Apply offset if needed
-        if (args.offset) {
-            items = items.slice(args.offset);
-        }
-        
-        // Apply limit if needed
-        if (args.limit) {
-            items = items.slice(0, args.limit);
-        }
-        
-        return items;
-    }
-
-    async set(key: string, value: string): Promise<void> {
-        await this.write({ set: [{ key, value }] });
-    }
-
-    async delete(key: string): Promise<void> {
-        await this.write({ delete: [key] });
-    }
-
-    async write(tx: { set?: { key: string; value: string }[]; delete?: string[] }): Promise<void> {
-        if (tx.set) {
-            for (const { key, value } of tx.set) {
-                this.data.set(key, value);
-            }
-        }
-        
-        if (tx.delete) {
-            for (const key of tx.delete) {
-                this.data.delete(key);
-            }
-        }
-    }
-}
-
-describe("AsyncBPlusTree with MockAsyncStorage", () => {
+describe("AsyncBPlusTree with AsyncInMemoryDatabase", () => {
     let bPlusTree: AsyncBPlusTree;
-    let store: MockAsyncStorage;
+    let store: AsyncInMemoryDatabase<string>;
     
     beforeEach(async () => {
-        // Use our mock async storage as the underlying storage
-        store = new MockAsyncStorage();
+        store = new AsyncInMemoryDatabase<string>();
         bPlusTree = new AsyncBPlusTree(store);
         await bPlusTree.init(); // Initialize the tree
     });

@@ -1,31 +1,32 @@
-import { AsyncOrderedKeyValueApi, WriteArgs, ListArgs } from '../lib/types'
-
-const LEAF_PREFIX = "00"
-const INTERNAL_PREFIX = "01"
-const METADATA_KEY = "__BPTREE_METADATA__"
-const DEFAULT_MAX_LEAF_SIZE = 32
-const DEFAULT_MAX_INTERNAL_SIZE = 32
-
-type LeafNode = {
-    keys: string[]
-    values: string[]
-    next?: string // Reference to next leaf node for range scans
-}
-
-type InternalNode = {
-    keys: string[]
-    children: string[] // References to child nodes
-}
-
-type NodePath = {
-    id: string
-    index: number
-}
-
-type TreeMetadata = {
-    rootId: string
-    height: number
-}
+import { AsyncOrderedKeyValueApi, WriteArgs, ListArgs } from "../lib/types"
+import {
+	DEFAULT_MAX_INTERNAL_SIZE,
+	DEFAULT_MAX_LEAF_SIZE,
+	INTERNAL_PREFIX,
+	InternalNode,
+	LEAF_PREFIX,
+	LeafNode,
+	METADATA_KEY,
+	NodePath,
+	ROOT_LEAF_ID,
+	TreeMetadata,
+	TreeNode,
+	borrowFromLeftSiblingNode,
+	borrowFromRightSiblingNode,
+	collectLeafRangePage,
+	createNodeId,
+	createRootInternalNode,
+	finalizeRangeResults,
+	findChildIndex,
+	insertIntoInternalNode,
+	mergeWithLeftSiblingNode,
+	mergeWithRightSiblingNode,
+	minKeysForNode,
+	partitionInternalNode,
+	partitionLeafNode,
+	removeLeafEntry,
+	upsertLeafEntry,
+} from "./node"
 
 /**
  * An asynchronous B+ Tree implementation on top of an ordered key-value store.
@@ -34,749 +35,360 @@ type TreeMetadata = {
  * - Internal nodes are prefixed with "01"
  */
 export class AsyncBPlusTree implements AsyncOrderedKeyValueApi<string, string> {
-    private rootId: string = "" // Reference to root node
-    private height: number = 0
-    private initialized: boolean = false
+	private rootId: string = ""
+	private height: number = 0
+	private initialized: boolean = false
 
-    /**
-     * Creates a new asynchronous B+ Tree
-     * 
-     * @param store The underlying asynchronous store to use
-     * @param maxLeafSize Maximum number of keys in a leaf node before splitting
-     * @param maxInternalSize Maximum number of keys in an internal node before splitting
-     */
-    constructor(
-        private store: AsyncOrderedKeyValueApi<string, string>,
-        private maxLeafSize: number = DEFAULT_MAX_LEAF_SIZE,
-        private maxInternalSize: number = DEFAULT_MAX_INTERNAL_SIZE
-    ) {
-        // Initialization is handled in the init method
-    }
+	constructor(
+		private store: AsyncOrderedKeyValueApi<string, string>,
+		private maxLeafSize: number = DEFAULT_MAX_LEAF_SIZE,
+		private maxInternalSize: number = DEFAULT_MAX_INTERNAL_SIZE
+	) {}
 
-    /**
-     * Initializes the B+ Tree, either loading an existing tree or creating a new one
-     */
-    async init(): Promise<void> {
-        // Try to load existing metadata
-        const metadataStr = await this.store.get(METADATA_KEY)
-        
-        if (metadataStr) {
-            // Tree already exists, load metadata
-            const metadata = JSON.parse(metadataStr) as TreeMetadata
-            this.rootId = metadata.rootId
-            this.height = metadata.height
-        } else {
-            // Initialize a new tree with an empty root leaf node
-            const rootNode: LeafNode = { keys: [], values: [] }
-            this.rootId = LEAF_PREFIX + "root"
-            this.height = 0
-            
-            await this.store.write({ 
-                set: [
-                    { key: this.rootId, value: JSON.stringify(rootNode) },
-                    { key: METADATA_KEY, value: JSON.stringify({ rootId: this.rootId, height: this.height }) }
-                ] 
-            })
-        }
-        
-        this.initialized = true
-    }
+	async init(): Promise<void> {
+		const metadataStr = await this.store.get(METADATA_KEY)
 
-    /**
-     * Saves the current tree metadata to the store
-     */
-    private async saveMetadata(): Promise<void> {
-        const metadata: TreeMetadata = {
-            rootId: this.rootId,
-            height: this.height
-        }
-        
-        await this.store.write({
-            set: [{ key: METADATA_KEY, value: JSON.stringify(metadata) }]
-        })
-    }
+		if (metadataStr) {
+			const metadata = JSON.parse(metadataStr) as TreeMetadata
+			this.rootId = metadata.rootId
+			this.height = metadata.height
+		} else {
+			const rootNode: LeafNode = { keys: [], values: [] }
+			this.rootId = ROOT_LEAF_ID
+			this.height = 0
 
-    /**
-     * Gets a value by key
-     * 
-     * @param key The key to look up
-     * @returns The value or undefined if not found
-     */
-    async get(key: string): Promise<string | undefined> {
-        if (!this.initialized) await this.init()
-        
-        const leafNode = await this.findLeaf(key)
-        const nodeStr = await this.store.get(leafNode)
-        if (!nodeStr) return undefined
-        
-        const node = JSON.parse(nodeStr) as LeafNode
-        const index = node.keys.indexOf(key)
-        return index !== -1 ? node.values[index] : undefined
-    }
+			await this.store.write({
+				set: [
+					{ key: this.rootId, value: JSON.stringify(rootNode) },
+					{
+						key: METADATA_KEY,
+						value: JSON.stringify({ rootId: this.rootId, height: this.height }),
+					},
+				],
+			})
+		}
 
-    /**
-     * Lists entries in a range
-     * 
-     * @param args Range query parameters
-     * @returns Array of key-value pairs in the range
-     */
-    async list(args: ListArgs<string> = {}): Promise<{ key: string; value: string }[]> {
-        if (!this.initialized) await this.init()
-        
-        const results: { key: string; value: string }[] = []
-        let current = await this.findLeaf(args.gte || args.gt || "")
-        
-        outer: while (current && current !== "") {
-            const nodeStr = await this.store.get(current)
-            if (!nodeStr) break
-            
-            const node = JSON.parse(nodeStr) as LeafNode
-            const startIndex = args.gt ? node.keys.findIndex(k => k > args.gt!) : 
-                              args.gte ? node.keys.findIndex(k => k >= args.gte!) : 0
-            
-            if (startIndex === -1) {
-                // No keys in this node match our criteria, move to next node
-                current = node.next || ""
-                continue
-            }
-            
-            for (let i = startIndex; i < node.keys.length; i++) {
-                const key = node.keys[i]
-                if (args.lt && key >= args.lt) break outer
-                if (args.lte && key > args.lte) break outer
-                
-                results.push({ key, value: node.values[i] })
-                if (!args.reverse && !args.offset && args.limit && results.length >= args.limit) break outer
-            }
-            
-            current = node.next || ""
-        }
-        
-        // Apply reverse, offset, and limit if needed
-        if (args.reverse) {
-            results.reverse()
-        }
-        
-        if (args.offset && args.offset > 0) {
-            results.splice(0, args.offset)
-        }
-        
-        if (args.limit !== undefined) {
-            results.splice(args.limit)
-        }
-        
-        return results
-    }
+		this.initialized = true
+	}
 
-    /**
-     * Sets a value for a key
-     * 
-     * @param key The key to set
-     * @param value The value to set
-     */
-    async set(key: string, value: string): Promise<void> {
-        if (!this.initialized) await this.init()
-        await this.write({ set: [{ key, value }] })
-    }
+	private async saveMetadata(): Promise<void> {
+		const metadata: TreeMetadata = {
+			rootId: this.rootId,
+			height: this.height,
+		}
 
-    /**
-     * Deletes a key
-     * 
-     * @param key The key to delete
-     */
-    async delete(key: string): Promise<void> {
-        if (!this.initialized) await this.init()
-        await this.write({ delete: [key] })
-    }
+		await this.store.write({
+			set: [{ key: METADATA_KEY, value: JSON.stringify(metadata) }],
+		})
+	}
 
-    /**
-     * Performs a batch write operation
-     * 
-     * @param tx The write transaction
-     */
-    async write(tx: WriteArgs<string, string>): Promise<void> {
-        if (!this.initialized) await this.init()
-        
-        // Process each operation individually
-        for (const { key, value } of tx.set || []) {
-            await this.insert(key, value)
-        }
-        for (const key of tx.delete || []) {
-            await this.remove(key)
-        }
-    }
+	private async readNode<T extends TreeNode>(nodeId: string): Promise<T> {
+		const nodeStr = await this.store.get(nodeId)
+		return JSON.parse(nodeStr || "{}") as T
+	}
 
-    /**
-     * Inserts a key-value pair into the tree
-     * 
-     * @param key The key to insert
-     * @param value The value to insert
-     */
-    private async insert(key: string, value: string): Promise<void> {
-        if (this.height === 0) {
-            // Tree is empty or has only a root leaf node
-            const nodeStr = await this.store.get(this.rootId)
-            const node = JSON.parse(nodeStr || "{}") as LeafNode
-            
-            // Insert into leaf node
-            const index = this.findInsertIndex(node.keys, key)
-            
-            // Replace value if key already exists
-            if (index < node.keys.length && node.keys[index] === key) {
-                node.values[index] = value
-                await this.store.write({ set: [{ key: this.rootId, value: JSON.stringify(node) }] })
-                return
-            }
-            
-            node.keys.splice(index, 0, key)
-            node.values.splice(index, 0, value)
-            
-            if (node.keys.length > this.maxLeafSize) {
-                await this.splitLeafNode(this.rootId, node)
-            } else {
-                await this.store.write({ set: [{ key: this.rootId, value: JSON.stringify(node) }] })
-            }
-            return
-        }
-        
-        // Find the leaf node where the key should be inserted
-        const path = await this.findNodePath(key)
-        const leafId = path[path.length - 1].id
-        const leafNodeStr = await this.store.get(leafId)
-        const leafNode = JSON.parse(leafNodeStr || "{}") as LeafNode
-        
-        // Insert into leaf node
-        const index = this.findInsertIndex(leafNode.keys, key)
-        
-        // Replace value if key already exists
-        if (index < leafNode.keys.length && leafNode.keys[index] === key) {
-            leafNode.values[index] = value
-            await this.store.write({ set: [{ key: leafId, value: JSON.stringify(leafNode) }] })
-            return
-        }
-        
-        leafNode.keys.splice(index, 0, key)
-        leafNode.values.splice(index, 0, value)
-        
-        if (leafNode.keys.length > this.maxLeafSize) {
-            await this.splitLeafNode(leafId, leafNode, path)
-        } else {
-            await this.store.write({ set: [{ key: leafId, value: JSON.stringify(leafNode) }] })
-        }
-    }
+	private async writeNode(nodeId: string, node: TreeNode): Promise<void> {
+		await this.store.write({
+			set: [{ key: nodeId, value: JSON.stringify(node) }],
+		})
+	}
 
-    /**
-     * Removes a key-value pair from the tree
-     * 
-     * @param key The key to remove
-     */
-    private async remove(key: string): Promise<void> {
-        if (this.height === 0) {
-            const rootNodeStr = await this.store.get(this.rootId)
-            const rootNode = JSON.parse(rootNodeStr || "{}") as LeafNode
-            const index = rootNode.keys.indexOf(key)
-            
-            if (index === -1) return
-            
-            rootNode.keys.splice(index, 1)
-            rootNode.values.splice(index, 1)
-            await this.store.write({ set: [{ key: this.rootId, value: JSON.stringify(rootNode) }] })
-            return
-        }
-        
-        // Find the leaf node containing the key
-        const path = await this.findNodePath(key)
-        const leafId = path[path.length - 1].id
-        const leafNodeStr = await this.store.get(leafId)
-        const leafNode = JSON.parse(leafNodeStr || "{}") as LeafNode
-        const index = leafNode.keys.indexOf(key)
-        
-        if (index === -1) return
-        
-        leafNode.keys.splice(index, 1)
-        leafNode.values.splice(index, 1)
-        
-        if (leafNode.keys.length < Math.ceil(this.maxLeafSize / 2) && path.length > 1) {
-            await this.rebalanceAfterDelete(leafId, leafNode, path)
-        } else {
-            await this.store.write({ set: [{ key: leafId, value: JSON.stringify(leafNode) }] })
-        }
-    }
+	async get(key: string): Promise<string | undefined> {
+		if (!this.initialized) await this.init()
 
-    /**
-     * Splits a leaf node when it exceeds the maximum size
-     * 
-     * @param nodeId ID of the node to split
-     * @param node The node to split
-     * @param path Path to the node (optional)
-     */
-    private async splitLeafNode(nodeId: string, node: LeafNode, path: NodePath[] = []): Promise<void> {
-        const mid = Math.floor(node.keys.length / 2)
-        const newNodeId = LEAF_PREFIX + Date.now() + Math.random().toString(36).substring(2, 10)
-        
-        const newNode: LeafNode = {
-            keys: node.keys.slice(mid),
-            values: node.values.slice(mid),
-            next: node.next
-        }
-        
-        node.keys = node.keys.slice(0, mid)
-        node.values = node.values.slice(0, mid)
-        node.next = newNodeId
-        
-        await this.store.write({
-            set: [
-                { key: nodeId, value: JSON.stringify(node) },
-                { key: newNodeId, value: JSON.stringify(newNode) }
-            ]
-        })
-        
-        // Update parent or create new root
-        const splitKey = newNode.keys[0]
-        if (path.length === 0) {
-            // This is the root node, create a new root
-            const newRoot: InternalNode = {
-                keys: [splitKey],
-                children: [nodeId, newNodeId]
-            }
-            const newRootId = INTERNAL_PREFIX + Date.now() + Math.random().toString(36).substring(2, 10)
-            await this.store.write({ set: [{ key: newRootId, value: JSON.stringify(newRoot) }] })
-            this.rootId = newRootId
-            this.height = 1
-            
-            // Update metadata with new root and height
-            await this.saveMetadata()
-        } else {
-            // Update parent node
-            await this.updateParentAfterSplit(nodeId, newNodeId, splitKey, path)
-        }
-    }
+		const leafNode = await this.findLeaf(key)
+		const nodeStr = await this.store.get(leafNode)
+		if (!nodeStr) return undefined
 
-    /**
-     * Splits an internal node when it exceeds the maximum size
-     * 
-     * @param nodeId ID of the node to split
-     * @param node The node to split
-     * @param path Path to the node
-     */
-    private async splitInternalNode(nodeId: string, node: InternalNode, path: NodePath[]): Promise<void> {
-        const mid = Math.floor(node.keys.length / 2)
-        const splitKey = node.keys[mid]
-        const newNodeId = INTERNAL_PREFIX + Date.now() + Math.random().toString(36).substring(2, 10)
-        
-        const newNode: InternalNode = {
-            keys: node.keys.slice(mid + 1),
-            children: node.children.slice(mid + 1)
-        }
-        
-        node.keys = node.keys.slice(0, mid)
-        node.children = node.children.slice(0, mid + 1)
-        
-        await this.store.write({
-            set: [
-                { key: nodeId, value: JSON.stringify(node) },
-                { key: newNodeId, value: JSON.stringify(newNode) }
-            ]
-        })
-        
-        if (path.length <= 1) {
-            // This is the root node, create a new root
-            const newRoot: InternalNode = {
-                keys: [splitKey],
-                children: [nodeId, newNodeId]
-            }
-            const newRootId = INTERNAL_PREFIX + Date.now() + Math.random().toString(36).substring(2, 10)
-            await this.store.write({ set: [{ key: newRootId, value: JSON.stringify(newRoot) }] })
-            this.rootId = newRootId
-            this.height++
-            
-            // Update metadata with new root and height
-            await this.saveMetadata()
-        } else {
-            // Update parent
-            const parentPath = path.slice(0, -1)
-            const parentEntry = parentPath[parentPath.length - 1]
-            const parentId = parentEntry?.id || this.rootId
-            const parentStr = await this.store.get(parentId)
-            const parent = JSON.parse(parentStr || "{}") as InternalNode
-            const childIndex = parentEntry.index
-            
-            // Insert the new node in the parent
-            parent.keys.splice(childIndex, 0, splitKey)
-            parent.children.splice(childIndex + 1, 0, newNodeId)
-            
-            if (parent.keys.length > this.maxInternalSize) {
-                await this.splitInternalNode(parentId, parent, parentPath)
-            } else {
-                await this.store.write({ set: [{ key: parentId, value: JSON.stringify(parent) }] })
-            }
-        }
-    }
+		const node = JSON.parse(nodeStr) as LeafNode
+		const index = node.keys.indexOf(key)
+		return index !== -1 ? node.values[index] : undefined
+	}
 
-    /**
-     * Updates a parent node after a child split
-     * 
-     * @param leftId ID of the left child
-     * @param rightId ID of the right child
-     * @param splitKey The key that separates the children
-     * @param path Path to the node
-     */
-    private async updateParentAfterSplit(leftId: string, rightId: string, splitKey: string, path: NodePath[]): Promise<void> {
-        const parentPath = path.slice(0, -1)
-        const parentEntry = parentPath[parentPath.length - 1]
-        const parentId = parentEntry?.id || this.rootId
-        const parentStr = await this.store.get(parentId)
-        const parent = JSON.parse(parentStr || "{}") as InternalNode
-        const childIndex = parentEntry.index
-        
-        // Insert the new node in the parent
-        parent.keys.splice(childIndex, 0, splitKey)
-        parent.children.splice(childIndex + 1, 0, rightId)
-        
-        if (parent.keys.length > this.maxInternalSize) {
-            await this.splitInternalNode(parentId, parent, parentPath)
-        } else {
-            await this.store.write({ set: [{ key: parentId, value: JSON.stringify(parent) }] })
-        }
-    }
+	async list(
+		args: ListArgs<string> = {}
+	): Promise<{ key: string; value: string }[]> {
+		if (!this.initialized) await this.init()
 
-    /**
-     * Rebalances the tree after a delete operation
-     * 
-     * @param nodeId ID of the node to rebalance
-     * @param node The node to rebalance
-     * @param path Path to the node
-     */
-    private async rebalanceAfterDelete(nodeId: string, node: LeafNode | InternalNode, path: NodePath[]): Promise<void> {
-        const parentPath = path.slice(0, -1)
-        const parentEntry = parentPath[parentPath.length - 1]
-        const parentId = parentEntry?.id || this.rootId
-        const parentStr = await this.store.get(parentId)
-        const parent = JSON.parse(parentStr || "{}") as InternalNode
-        const childIndex = parentEntry.index
-        
-        const minKeys = 'values' in node ? Math.ceil(this.maxLeafSize / 2) : Math.ceil(this.maxInternalSize / 2)
-        
-        // Try to borrow from left sibling
-        if (childIndex > 0) {
-            const leftSiblingId = parent.children[childIndex - 1]
-            const leftSiblingStr = await this.store.get(leftSiblingId)
-            const leftSibling = JSON.parse(leftSiblingStr || "{}") as any
-            
-            if (leftSibling.keys.length > minKeys) {
-                await this.borrowFromLeftSibling(nodeId, node, leftSiblingId, leftSibling, parentId, parent, childIndex)
-                return
-            }
-        }
-        
-        // Try to borrow from right sibling
-        if (childIndex < parent.children.length - 1) {
-            const rightSiblingId = parent.children[childIndex + 1]
-            const rightSiblingStr = await this.store.get(rightSiblingId)
-            const rightSibling = JSON.parse(rightSiblingStr || "{}") as any
-            
-            if (rightSibling.keys.length > minKeys) {
-                await this.borrowFromRightSibling(nodeId, node, rightSiblingId, rightSibling, parentId, parent, childIndex)
-                return
-            }
-        }
-        
-        // Merge with a sibling
-        if (childIndex > 0) {
-            // Merge with left sibling
-            const leftSiblingId = parent.children[childIndex - 1]
-            const leftSiblingStr = await this.store.get(leftSiblingId)
-            const leftSibling = JSON.parse(leftSiblingStr || "{}") as any
-            await this.mergeWithLeftSibling(nodeId, node, leftSiblingId, leftSibling, parentId, parent, childIndex, parentPath)
-        } else {
-            // Merge with right sibling
-            const rightSiblingId = parent.children[childIndex + 1]
-            const rightSiblingStr = await this.store.get(rightSiblingId)
-            const rightSibling = JSON.parse(rightSiblingStr || "{}") as any
-            await this.mergeWithRightSibling(nodeId, node, rightSiblingId, rightSibling, parentId, parent, childIndex, parentPath)
-        }
-    }
+		const results: { key: string; value: string }[] = []
+		let current = await this.findLeaf(args.gte || args.gt || "")
 
-    /**
-     * Borrows a key-value pair from the left sibling
-     */
-    private async borrowFromLeftSibling(
-        nodeId: string,
-        node: any,
-        leftSiblingId: string,
-        leftSibling: any,
-        parentId: string,
-        parent: InternalNode,
-        childIndex: number
-    ): Promise<void> {
-        // For leaf nodes
-        if ('values' in node && 'values' in leftSibling) {
-            // Move the rightmost key-value pair from left sibling to node
-            const key = leftSibling.keys.pop()
-            const value = leftSibling.values.pop()
-            node.keys.unshift(key)
-            node.values.unshift(value)
-            
-            // Update parent key
-            parent.keys[childIndex - 1] = node.keys[0]
-        } else {
-            // For internal nodes
-            // Move the rightmost child from left sibling to node
-            const parentKey = parent.keys[childIndex - 1]
-            const childId = leftSibling.children.pop()
-            const key = leftSibling.keys.pop()
-            
-            node.keys.unshift(parentKey)
-            node.children.unshift(childId)
-            parent.keys[childIndex - 1] = key
-        }
-        
-        await this.store.write({
-            set: [
-                { key: nodeId, value: JSON.stringify(node) },
-                { key: leftSiblingId, value: JSON.stringify(leftSibling) },
-                { key: parentId, value: JSON.stringify(parent) }
-            ]
-        })
-    }
+		while (current && current !== "") {
+			const nodeStr = await this.store.get(current)
+			if (!nodeStr) break
 
-    /**
-     * Borrows a key-value pair from the right sibling
-     */
-    private async borrowFromRightSibling(
-        nodeId: string,
-        node: any,
-        rightSiblingId: string,
-        rightSibling: any,
-        parentId: string,
-        parent: InternalNode,
-        childIndex: number
-    ): Promise<void> {
-        // For leaf nodes
-        if ('values' in node && 'values' in rightSibling) {
-            // Move the leftmost key-value pair from right sibling to node
-            const key = rightSibling.keys.shift()
-            const value = rightSibling.values.shift()
-            node.keys.push(key)
-            node.values.push(value)
-            
-            // Update parent key
-            parent.keys[childIndex] = rightSibling.keys[0]
-        } else {
-            // For internal nodes
-            // Move the leftmost child from right sibling to node
-            const parentKey = parent.keys[childIndex]
-            const childId = rightSibling.children.shift()
-            const key = rightSibling.keys.shift()
-            
-            node.keys.push(parentKey)
-            node.children.push(childId)
-            parent.keys[childIndex] = key
-        }
-        
-        await this.store.write({
-            set: [
-                { key: nodeId, value: JSON.stringify(node) },
-                { key: rightSiblingId, value: JSON.stringify(rightSibling) },
-                { key: parentId, value: JSON.stringify(parent) }
-            ]
-        })
-    }
+			const node = JSON.parse(nodeStr) as LeafNode
+			if (!collectLeafRangePage(node, args, results)) {
+				break
+			}
+			current = node.next || ""
+		}
 
-    /**
-     * Merges a node with its left sibling
-     */
-    private async mergeWithLeftSibling(
-        nodeId: string,
-        node: any,
-        leftSiblingId: string,
-        leftSibling: any,
-        parentId: string,
-        parent: InternalNode,
-        childIndex: number,
-        parentPath: NodePath[]
-    ): Promise<void> {
-        // For leaf nodes
-        if ('values' in node && 'values' in leftSibling) {
-            leftSibling.keys = [...leftSibling.keys, ...node.keys]
-            leftSibling.values = [...leftSibling.values, ...node.values]
-            leftSibling.next = node.next
-        } else {
-            // For internal nodes
-            // Include the parent key in the merge
-            const parentKey = parent.keys[childIndex - 1]
-            leftSibling.keys = [...leftSibling.keys, parentKey, ...node.keys]
-            leftSibling.children = [...leftSibling.children, ...node.children]
-        }
-        
-        // Remove the node and update parent
-        parent.keys.splice(childIndex - 1, 1)
-        parent.children.splice(childIndex, 1)
-        
-        await this.store.write({
-            set: [
-                { key: leftSiblingId, value: JSON.stringify(leftSibling) },
-                { key: parentId, value: JSON.stringify(parent) }
-            ],
-            delete: [nodeId]
-        })
-        
-        // Check if parent needs rebalancing
-        if (parent.keys.length < Math.ceil(this.maxInternalSize / 2) && parentPath.length > 1) {
-            await this.rebalanceAfterDelete(parentId, parent, parentPath)
-        } else if (parent.keys.length === 0 && parentId === this.rootId) {
-            // Root is empty, make the merged node the new root
-            this.rootId = leftSiblingId
-            this.height--
-            await this.store.write({ delete: [parentId] })
-            
-            // Update metadata with new root and height
-            await this.saveMetadata()
-        }
-    }
+		return finalizeRangeResults(results, args)
+	}
 
-    /**
-     * Merges a node with its right sibling
-     */
-    private async mergeWithRightSibling(
-        nodeId: string,
-        node: any,
-        rightSiblingId: string,
-        rightSibling: any,
-        parentId: string,
-        parent: InternalNode,
-        childIndex: number,
-        parentPath: NodePath[]
-    ): Promise<void> {
-        // For leaf nodes
-        if ('values' in node && 'values' in rightSibling) {
-            node.keys = [...node.keys, ...rightSibling.keys]
-            node.values = [...node.values, ...rightSibling.values]
-            node.next = rightSibling.next
-        } else {
-            // For internal nodes
-            // Include the parent key in the merge
-            const parentKey = parent.keys[childIndex]
-            node.keys = [...node.keys, parentKey, ...rightSibling.keys]
-            node.children = [...node.children, ...rightSibling.children]
-        }
-        
-        // Remove the right sibling and update parent
-        parent.keys.splice(childIndex, 1)
-        parent.children.splice(childIndex + 1, 1)
-        
-        await this.store.write({
-            set: [
-                { key: nodeId, value: JSON.stringify(node) },
-                { key: parentId, value: JSON.stringify(parent) }
-            ],
-            delete: [rightSiblingId]
-        })
-        
-        // Check if parent needs rebalancing
-        if (parent.keys.length < Math.ceil(this.maxInternalSize / 2) && parentPath.length > 1) {
-            await this.rebalanceAfterDelete(parentId, parent, parentPath)
-        } else if (parent.keys.length === 0 && parentId === this.rootId) {
-            // Root is empty, make the merged node the new root
-            this.rootId = nodeId
-            this.height--
-            await this.store.write({ delete: [parentId] })
-            
-            // Update metadata with new root and height
-            await this.saveMetadata()
-        }
-    }
+	async set(key: string, value: string): Promise<void> {
+		if (!this.initialized) await this.init()
+		await this.write({ set: [{ key, value }] })
+	}
 
-    /**
-     * Finds the path from the root to the leaf node that should contain the key
-     * 
-     * @param key The key to look up
-     * @returns Array of node paths from root to leaf
-     */
-    private async findNodePath(key: string): Promise<NodePath[]> {
-        const path: NodePath[] = []
-        let current = this.rootId
-        let level = 0
-        
-        while (level < this.height) {
-            const nodeStr = await this.store.get(current)
-            const node = JSON.parse(nodeStr || "{}") as InternalNode
-            const index = this.findChildIndex(node.keys, key)
-            path.push({ id: current, index })
-            current = node.children[index] || node.children[node.children.length - 1]
-            level++
-        }
-        
-        path.push({ id: current, index: -1 }) // Leaf node doesn't need an index
-        return path
-    }
+	async delete(key: string): Promise<void> {
+		if (!this.initialized) await this.init()
+		await this.write({ delete: [key] })
+	}
 
-    /**
-     * Finds the leaf node that should contain the key
-     * 
-     * @param key The key to look up
-     * @returns ID of the leaf node
-     */
-    private async findLeaf(key: string): Promise<string> {
-        let current = this.rootId
-        let level = 0
-        
-        while (level < this.height) {
-            const nodeStr = await this.store.get(current)
-            const node = JSON.parse(nodeStr || "{}") as InternalNode
-            const index = this.findChildIndex(node.keys, key)
-            current = node.children[index] || node.children[node.children.length - 1]
-            level++
-        }
-        
-        return current
-    }
+	async write(tx: WriteArgs<string, string>): Promise<void> {
+		if (!this.initialized) await this.init()
 
-    /**
-     * Finds the index of the child that should contain the key
-     * 
-     * @param keys Array of keys
-     * @param key The key to look up
-     * @returns Index of the child
-     */
-    private findChildIndex(keys: string[], key: string): number {
-        let left = 0
-        let right = keys.length
-        
-        while (left < right) {
-            const mid = Math.floor((left + right) / 2)
-            if (keys[mid] <= key) {
-                left = mid + 1
-            } else {
-                right = mid
-            }
-        }
-        
-        return left
-    }
+		for (const { key, value } of tx.set || []) {
+			await this.insert(key, value)
+		}
+		for (const key of tx.delete || []) {
+			await this.remove(key)
+		}
+	}
 
-    /**
-     * Finds the index where a key should be inserted
-     * 
-     * @param keys Array of keys
-     * @param key The key to insert
-     * @returns Index where the key should be inserted
-     */
-    private findInsertIndex(keys: string[], key: string): number {
-        let left = 0
-        let right = keys.length
-        
-        while (left < right) {
-            const mid = Math.floor((left + right) / 2)
-            if (keys[mid] < key) {
-                left = mid + 1
-            } else if (keys[mid] === key) {
-                return mid
-            } else {
-                right = mid
-            }
-        }
-        
-        return left
-    }
+	private async insert(key: string, value: string): Promise<void> {
+		const path = await this.findNodePath(key)
+		const leafId = path[path.length - 1].id
+		const leafNode = await this.readNode<LeafNode>(leafId)
+
+		if (!upsertLeafEntry(leafNode, key, value)) {
+			await this.writeNode(leafId, leafNode)
+			return
+		}
+
+		if (leafNode.keys.length > this.maxLeafSize) {
+			await this.splitLeafNode(leafId, leafNode, path)
+		} else {
+			await this.writeNode(leafId, leafNode)
+		}
+	}
+
+	private async remove(key: string): Promise<void> {
+		const path = await this.findNodePath(key)
+		const leafId = path[path.length - 1].id
+		const leafNode = await this.readNode<LeafNode>(leafId)
+
+		if (!removeLeafEntry(leafNode, key)) return
+
+		if (
+			leafNode.keys.length < Math.ceil(this.maxLeafSize / 2) &&
+			path.length > 1
+		) {
+			await this.rebalanceAfterDelete(leafId, leafNode, path)
+		} else {
+			await this.writeNode(leafId, leafNode)
+		}
+	}
+
+	private async splitLeafNode(
+		nodeId: string,
+		node: LeafNode,
+		path: NodePath[] = []
+	): Promise<void> {
+		const newNodeId = createNodeId(LEAF_PREFIX)
+		const { splitKey, newNode } = partitionLeafNode(node, newNodeId)
+
+		await this.store.write({
+			set: [
+				{ key: nodeId, value: JSON.stringify(node) },
+				{ key: newNodeId, value: JSON.stringify(newNode) },
+			],
+		})
+
+		if (path.length <= 1) {
+			await this.promoteNewRoot(nodeId, newNodeId, splitKey, 1)
+		} else {
+			await this.updateParentAfterSplit(newNodeId, splitKey, path)
+		}
+	}
+
+	private async splitInternalNode(
+		nodeId: string,
+		node: InternalNode,
+		path: NodePath[]
+	): Promise<void> {
+		const newNodeId = createNodeId(INTERNAL_PREFIX)
+		const { splitKey, newNode } = partitionInternalNode(node)
+
+		await this.store.write({
+			set: [
+				{ key: nodeId, value: JSON.stringify(node) },
+				{ key: newNodeId, value: JSON.stringify(newNode) },
+			],
+		})
+
+		if (path.length <= 1) {
+			await this.promoteNewRoot(nodeId, newNodeId, splitKey, this.height + 1)
+		} else {
+			await this.updateParentAfterSplit(newNodeId, splitKey, path)
+		}
+	}
+
+	private async promoteNewRoot(
+		leftId: string,
+		rightId: string,
+		splitKey: string,
+		nextHeight: number
+	): Promise<void> {
+		const newRoot = createRootInternalNode(splitKey, leftId, rightId)
+		const newRootId = createNodeId(INTERNAL_PREFIX)
+		await this.writeNode(newRootId, newRoot)
+		this.rootId = newRootId
+		this.height = nextHeight
+		await this.saveMetadata()
+	}
+
+	private async updateParentAfterSplit(
+		rightId: string,
+		splitKey: string,
+		path: NodePath[]
+	): Promise<void> {
+		const parentPath = path.slice(0, -1)
+		const parentEntry = parentPath[parentPath.length - 1]
+		const parentId = parentEntry?.id || this.rootId
+		const parent = await this.readNode<InternalNode>(parentId)
+
+		insertIntoInternalNode(parent, parentEntry.index, splitKey, rightId)
+
+		if (parent.keys.length > this.maxInternalSize) {
+			await this.splitInternalNode(parentId, parent, parentPath)
+		} else {
+			await this.writeNode(parentId, parent)
+		}
+	}
+
+	private async rebalanceAfterDelete(
+		nodeId: string,
+		node: TreeNode,
+		path: NodePath[]
+	): Promise<void> {
+		const parentPath = path.slice(0, -1)
+		const parentEntry = parentPath[parentPath.length - 1]
+		const parentId = parentEntry?.id || this.rootId
+		const parent = await this.readNode<InternalNode>(parentId)
+		const childIndex = parentEntry.index
+		const minKeys = minKeysForNode(node, this.maxLeafSize, this.maxInternalSize)
+
+		if (childIndex > 0) {
+			const leftSiblingId = parent.children[childIndex - 1]
+			const leftSibling = await this.readNode<TreeNode>(leftSiblingId)
+
+			if (leftSibling.keys.length > minKeys) {
+				borrowFromLeftSiblingNode(node, leftSibling, parent, childIndex)
+				await this.store.write({
+					set: [
+						{ key: nodeId, value: JSON.stringify(node) },
+						{ key: leftSiblingId, value: JSON.stringify(leftSibling) },
+						{ key: parentId, value: JSON.stringify(parent) },
+					],
+				})
+				return
+			}
+		}
+
+		if (childIndex < parent.children.length - 1) {
+			const rightSiblingId = parent.children[childIndex + 1]
+			const rightSibling = await this.readNode<TreeNode>(rightSiblingId)
+
+			if (rightSibling.keys.length > minKeys) {
+				borrowFromRightSiblingNode(node, rightSibling, parent, childIndex)
+				await this.store.write({
+					set: [
+						{ key: nodeId, value: JSON.stringify(node) },
+						{ key: rightSiblingId, value: JSON.stringify(rightSibling) },
+						{ key: parentId, value: JSON.stringify(parent) },
+					],
+				})
+				return
+			}
+		}
+
+		if (childIndex > 0) {
+			const leftSiblingId = parent.children[childIndex - 1]
+			const leftSibling = await this.readNode<TreeNode>(leftSiblingId)
+			mergeWithLeftSiblingNode(node, leftSibling, parent, childIndex)
+			await this.commitMerge(
+				leftSiblingId,
+				leftSibling,
+				nodeId,
+				parentId,
+				parent,
+				parentPath
+			)
+		} else {
+			const rightSiblingId = parent.children[childIndex + 1]
+			const rightSibling = await this.readNode<TreeNode>(rightSiblingId)
+			mergeWithRightSiblingNode(node, rightSibling, parent, childIndex)
+			await this.commitMerge(
+				nodeId,
+				node,
+				rightSiblingId,
+				parentId,
+				parent,
+				parentPath
+			)
+		}
+	}
+
+	private async commitMerge(
+		survivingId: string,
+		survivingNode: TreeNode,
+		removedId: string,
+		parentId: string,
+		parent: InternalNode,
+		parentPath: NodePath[]
+	): Promise<void> {
+		await this.store.write({
+			set: [
+				{ key: survivingId, value: JSON.stringify(survivingNode) },
+				{ key: parentId, value: JSON.stringify(parent) },
+			],
+			delete: [removedId],
+		})
+
+		if (
+			parent.keys.length < Math.ceil(this.maxInternalSize / 2) &&
+			parentPath.length > 1
+		) {
+			await this.rebalanceAfterDelete(parentId, parent, parentPath)
+		} else if (parent.keys.length === 0 && parentId === this.rootId) {
+			this.rootId = survivingId
+			this.height--
+			await this.store.write({ delete: [parentId] })
+			await this.saveMetadata()
+		}
+	}
+
+	private async findNodePath(key: string): Promise<NodePath[]> {
+		const path: NodePath[] = []
+		let current = this.rootId
+		let level = 0
+
+		while (level < this.height) {
+			const node = await this.readNode<InternalNode>(current)
+			const index = findChildIndex(node.keys, key)
+			path.push({ id: current, index })
+			current = node.children[index] || node.children[node.children.length - 1]
+			level++
+		}
+
+		path.push({ id: current, index: -1 })
+		return path
+	}
+
+	private async findLeaf(key: string): Promise<string> {
+		let current = this.rootId
+		let level = 0
+
+		while (level < this.height) {
+			const node = await this.readNode<InternalNode>(current)
+			const index = findChildIndex(node.keys, key)
+			current = node.children[index] || node.children[node.children.length - 1]
+			level++
+		}
+
+		return current
+	}
 }
